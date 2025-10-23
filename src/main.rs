@@ -3,17 +3,21 @@ use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
+use serde_json::Value;
+use std::fs;
 use std::fs::OpenOptions;
-use std::io::Read;
-use std::io::Write;
+use std::io::{self, BufRead, BufReader, Read, Write, Seek, SeekFrom};
 use std::env;
 use std::error::Error;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::fs::{File, write, remove_file};
 use tokio::time::{sleep, Duration};
 use flate2::read::GzDecoder;
 use std::collections::HashMap;
 use url::Url;
+use readability_rust::{Readability, ReadabilityOptions};
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+
 
 #[derive(Debug, Deserialize)]
 struct CcRecord {
@@ -184,13 +188,10 @@ fn records_to_map(records: &[DomainRecord]) -> HashMap<String, &DomainRecord> {
 	for rec in records {
 		map.insert(rec.host.clone(), rec);
 	}
-	map
+	return map;
 }
 
-fn de_from_str<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-	D: serde::Deserializer<'de>,
-{
+fn de_from_str<'de, D>(deserializer: D) -> Result<u64, D::Error> where D: serde::Deserializer<'de> {
 	let s = String::deserialize(deserializer)?;
 	s.parse::<u64>().map_err(serde::de::Error::custom)
 }
@@ -204,15 +205,157 @@ fn build_index_url(cc_crawl: &String) -> String {
 
 fn build_output_file(cc_crawl: &String) -> String {
 	format!(
-		"data/{}.warc",
+		"/mnt/data_ssd/{}.warc",
 		cc_crawl
 	)
 }
 
-const DELAY_MS: u64 = 1000; // delay between requests
+async fn fetch_and_write(client: &reqwest::Client, rec: &CcRecord, writer: &mut std::io::BufWriter<std::fs::File>) -> anyhow::Result<()> {
+	let offset = rec.offset;
+	let length = rec.length;
+	let range = format!("bytes={}-{}", offset, offset + length - 1);
+	let warc_url = format!("https://data.commoncrawl.org/{}", rec.filename);
+
+	let resp = client.get(&warc_url).header("Range", range).send().await?;
+	if !resp.status().is_success() {
+		eprintln!("[WARN] Skipping {} (HTTP {})", warc_url, resp.status());
+		eprintln!("sleeping a bit before continuing.");
+		sleep(Duration::from_millis(1000)).await;
+		return Ok(());
+	}
+
+	let bytes = resp.bytes().await?;
+	let mut gz = GzDecoder::new(&bytes[..]);
+
+	let mut decompressed = Vec::new();
+	gz.read_to_end(&mut decompressed)?; // decompress fully into memory
+
+	writer.write_all(&decompressed)?;
+	writer.flush()?;
+
+	println!("[OK] Wrote uncompressed WARC for {}", rec.url);
+	Ok(())
+}
+
+fn parse() -> Result<(), Box<dyn std::error::Error>> {
+
+	let html = fs::read_to_string("ww2.html")?;
+	let base_url = Url::parse("https://en.wikipedia.org/wiki/World_War_II")?;
+
+	// set up readability options (you can tweak these)
+	let options = ReadabilityOptions {
+		..Default::default()
+	};
+
+	// parse article
+	let mut readability = Readability::new(&html, Some(options))?;
+	if let Some(article) = readability.parse() {
+		println!("Title: {}", article.title.unwrap());
+		println!("\nPlain text:\n{}\n", article.text_content.unwrap());
+	} else {
+		println!("❌ No article content extracted.");
+	}
+
+	return Ok(());
+}
+
+fn read_warc_headers(file_path: &str) -> io::Result<()> {
+	let mut file = File::open(file_path)?;
+	let mut reader = BufReader::new(&file);
+
+	// create unique tmp filename
+	let unique_id = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap()
+		.as_nanos();
+	let tmp_path = format!("/tmp/warc_{}.html", unique_id);
+
+	let out_path = format!("{}.json", file_path);
+	let mut out_file = OpenOptions::new()
+		.create(true)
+		.append(true)
+		.open(&out_path)?;
+
+	loop {
+		let mut headers = Vec::new();
+		let mut line = String::new();
+
+		// Read header lines until we hit an empty line
+		loop {
+			line.clear();
+			let bytes = reader.read_line(&mut line)?;
+			if bytes == 0 {
+				// EOF
+				remove_file(&tmp_path);
+				return Ok(());
+			}
+			if line.trim().is_empty() {
+				break;
+			}
+			headers.push(line.trim_end().to_string());
+		}
+
+		if headers.is_empty() {
+			break;
+		}
+
+		// Extract Content-Length if present
+		let mut content_length = 0usize;
+		for h in &headers {
+			if let Some(value) = h.strip_prefix("Content-Length: ") {
+				content_length = value.parse::<usize>().unwrap_or(0);
+			}
+		}
+
+		if content_length > 0 {
+			// Skip the content body
+			let mut content = vec![0u8; content_length + 4];
+			reader.read_exact(&mut content)?;
+
+			write(&tmp_path, &content)?;
+
+			// run python script
+			let output = Command::new("python3")
+				.arg("html2text.py")
+				.arg(&tmp_path)
+				.stdout(Stdio::piped())
+				.stderr(Stdio::null())
+				.output()?;
+
+			if output.status.success() {
+				let json_output = String::from_utf8_lossy(&output.stdout);
+
+				// parse json
+				if let Ok(parsed) = serde_json::from_str::<Value>(&json_output) {
+					let lang = parsed.get("lang").and_then(Value::as_str).unwrap_or("");
+					let lang_prob = parsed.get("lang_prob").and_then(Value::as_str)
+						.and_then(|s| s.parse::<f64>().ok())
+						.unwrap_or(0.0);
+					let text = parsed.get("text").and_then(Value::as_str).unwrap_or("");
+
+					if lang == "sv" && lang_prob > 0.8 && text.len() > 100 {
+						let compact = serde_json::to_string(&parsed)?;
+						writeln!(out_file, "{}", compact)?;
+						println!("Wrote to output");
+					}
+				}
+			}
+		}
+	}
+	remove_file(&tmp_path);
+	return Ok(());
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
+
+	let file_path = "/mnt/data_ssd/CC-MAIN-2013-20.warc";
+	read_warc_headers(file_path);
+	return Ok(());
+
+	parse();
+	return Ok(());
+
 
 	let path = "se_domains.txt";
 	let se_domains = read_se_domains(path).unwrap();
@@ -227,7 +370,9 @@ async fn main() -> Result<()> {
 
 	let cc_crawl = &args[1];
 
-	let client = Client::builder().build()?;
+	let client = Client::builder()
+		.user_agent("CommonCrawlResearchBot/1.0 (contact: josefcullhed@gmail.com)")
+		.build()?;
 	println!("[INFO] Querying Common Crawl index: {}", build_index_url(cc_crawl));
 
 	let resp = client.get(build_index_url(cc_crawl)).send().await?;
@@ -266,34 +411,5 @@ async fn main() -> Result<()> {
 	}
 
 	println!("[DONE] Saved raw WARC records to {}", build_output_file(cc_crawl));
-	Ok(())
-}
-
-async fn fetch_and_write(
-	client: &reqwest::Client,
-	rec: &CcRecord,
-	writer: &mut std::io::BufWriter<std::fs::File>,
-) -> anyhow::Result<()> {
-	let offset = rec.offset;
-	let length = rec.length;
-	let range = format!("bytes={}-{}", offset, offset + length - 1);
-	let warc_url = format!("https://data.commoncrawl.org/{}", rec.filename);
-
-	let resp = client.get(&warc_url).header("Range", range).send().await?;
-	if !resp.status().is_success() {
-		eprintln!("[WARN] Skipping {} (HTTP {})", rec.url, resp.status());
-		return Ok(());
-	}
-
-	let bytes = resp.bytes().await?;
-	let mut gz = GzDecoder::new(&bytes[..]);
-
-	let mut decompressed = Vec::new();
-	gz.read_to_end(&mut decompressed)?; // decompress fully into memory
-
-	writer.write_all(&decompressed)?;
-	writer.flush()?;
-
-	println!("[OK] Wrote uncompressed WARC for {}", rec.url);
 	Ok(())
 }

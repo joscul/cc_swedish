@@ -83,40 +83,41 @@ datasets=(
 	CC-MAIN-2016-22
 	CC-MAIN-2016-18
 	CC-MAIN-2016-07
-	CC-MAIN-2015-48
-	CC-MAIN-2015-40
-	CC-MAIN-2015-35
-	CC-MAIN-2015-32
-	CC-MAIN-2015-27
-	CC-MAIN-2015-22
-	CC-MAIN-2015-18
-	CC-MAIN-2015-14
-	CC-MAIN-2015-11
-	CC-MAIN-2015-06
-	CC-MAIN-2014-52
-	CC-MAIN-2014-49
-	CC-MAIN-2014-42
-	CC-MAIN-2014-41
-	CC-MAIN-2014-35
-	CC-MAIN-2014-23
-	CC-MAIN-2014-15
-	CC-MAIN-2014-10
-	CC-MAIN-2013-48
-	CC-MAIN-2013-20
 )
+
+#CC-MAIN-2015-48
+#CC-MAIN-2015-40
+#CC-MAIN-2015-35
+#CC-MAIN-2015-32
+#CC-MAIN-2015-27
+#CC-MAIN-2015-22
+#CC-MAIN-2015-18
+#CC-MAIN-2015-14
+#CC-MAIN-2015-11
+#CC-MAIN-2015-06
+#CC-MAIN-2014-52
+#CC-MAIN-2014-49
+#CC-MAIN-2014-42
+#CC-MAIN-2014-41
+#CC-MAIN-2014-35
+#CC-MAIN-2014-23
+#CC-MAIN-2014-15
+#CC-MAIN-2014-10
+#CC-MAIN-2013-48
+#CC-MAIN-2013-20
 
 # Run tasks with limited concurrency
 run_job() {
 	local dataset=$1
-	local delay=$((RANDOM % 100 + 1))
+	local delay=$((RANDOM % 300 + 1))
 	echo "[$dataset] Sleeping ${delay}s before start..."
 	sleep "$delay"
 	echo "Starting: $dataset"
-	./target/release/cc_swedish "$dataset"
+	./target/release/cc_swedish "$dataset" > /dev/null
 	echo "Completed: $dataset"
 }
 
 export -f run_job
 
-printf "%s\n" "${datasets[@]}" | xargs -n1 -P"$num_concurrent" bash -c 'run_job "$@"' _
+printf "%s\n" "${datasets[@]}" | tac | xargs -n1 -P"$num_concurrent" bash -c 'run_job "$@"' _
 
